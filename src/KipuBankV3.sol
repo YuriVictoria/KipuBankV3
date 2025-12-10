@@ -8,7 +8,7 @@ import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interf
 
 /// @title KipuBankV2
 /// @author @YuriVictoria
-contract KipuBankV2 is AccessControl {
+contract KipuBankV3 is AccessControl {
 
     /// @notice Token(address) to Chainlink oracle(address) 
     mapping(address => address) public tokenToOracle;
