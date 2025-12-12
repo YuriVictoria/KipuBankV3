@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
@@ -13,6 +14,8 @@ import {IUniversalRouter} from "./IUniversalRouter.sol";
 /// @title KipuBankV3
 /// @author @YuriVictoria
 contract KipuBankV3 is AccessControl {
+    using SafeERC20 for IERC20;
+
 
     address public immutable addrUSDC;
     address public immutable addrWETH;
@@ -225,22 +228,16 @@ contract KipuBankV3 is AccessControl {
     /// @param _token address of token contract
     /// @param _amount deposit amount
     function depositToken(address _token, uint256 _amount) external validDepositValue(_amount) inBankCap(_token, _amount) {
-        if (_token == address(0)) revert("Try depositETH");
-        
-        balance[msg.sender] += _amount;
-        qttDeposits[msg.sender] += 1;
-        
-        bool success = IERC20(_token).transferFrom(msg.sender, address(this), _amount);
-        require(success, "Transfer failed");
-
-        emit Deposited(msg.sender, _token, _amount);
-        // 1. Transferir o token para este contrato
-        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
-        // 2. Aprovar o Router para gastar o token
-        IERC20(_token).safeApprove(address(router), _amount);
-        // 3. Chamar a função execute() do router com os comandos de swap
-        // ... lógica do swap ...
-        // 4. Atualizar balanço, contador e emitir evento.
+        if (_token == address(0)) revert("Use depositETH()");
+        if (_token == addrUSDC) {
+            IERC20(addrUSDC).safeTransferFrom(msg.sender, address(this), _amount);
+            balance[msg.sender] += _amount;
+            qttDeposits[msg.sender] += 1;
+            emit Deposited(msg.sender, _token, _amount);
+        } else {
+            IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
+            revert("Swap logic for this token is not yet implemented.");
+        }
     }
 
     /// @notice withdrawUSDC
