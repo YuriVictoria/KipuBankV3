@@ -19,6 +19,9 @@ contract KipuBankV3 is AccessControl {
     IPermit2 public immutable permit;
     IUniversalRouter public immutable router;
 
+    uint256 public constant TOLERANCE = 50; // 0.5%
+    uint24 public constant POOL = 3000; // 0.3%
+
     /// @notice Token(address) to Chainlink oracle(address) 
     mapping(address => address) public tokenToOracle;
     
@@ -183,24 +186,39 @@ contract KipuBankV3 is AccessControl {
         uint8 usdcDecimals = IERC20Metadata(addrUSDC).decimals();
         uint8 oracleDecimals = oracle.decimals();
 
-        // A fórmula para conversão de valor considerando as casas decimais é:
-        // valorFinal = (quantidadeToken * preçoOracle * 10^decimaisTokenFinal) / (10^decimaisTokenInicial * 10^decimaisOracle)
-        // No nosso caso, o token final é sempre USDC.
-        // O preço do oracle (ex: ETH/USD) tem 'oracleDecimals' casas decimais.
-        // A quantidade do token de entrada tem 'tokenDecimals' casas decimais.
-        // Queremos o resultado em unidades atômicas de USDC, que tem 'usdcDecimals' casas decimais.
         return (_amount * uint256(price) * (10 ** usdcDecimals)) / ((10 ** tokenDecimals) * (10 ** oracleDecimals));
     }
 
     /// @notice Verify conditions and make the deposit of msg.value
     function depositETH() external payable validDepositValue(msg.value) inBankCap(address(0), msg.value) {
-        try this._swapExactInputSingle(addrWETH, msg.value, _commands, _inputs) returns (uint256 amountUSDC) {
-            balance[msg.sender] += amountUSDC;
-            qttDeposits[msg.sender] += 1;
-            emit Deposited(msg.sender, address(0), msg.value);
-        } catch {
-            revert("Token sem liquidez ou rota invalida na Uniswap");
-        }
+        uint256 priceUSDCInChainlink = getTokenValueInUSDC(address(0), msg.value);
+        uint256 minSwap = (priceUSDCInChainlink * (10000 - TOLERANCE)) / 10000;
+
+        bytes memory path = abi.encodePacked(addrWETH, POOL, addrUSDC);
+
+        bytes memory commands = abi.encodePacked(IUniversalRouter.V3_SWAP_EXACT_IN);
+
+        // The input for V3_SWAP_EXACT_IN: (recipient, amountIn, amountOutMinimum, path, payerIsUser)
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(
+            address(this),
+            msg.value,
+            minSwap,
+            path,
+            false
+        );
+
+        uint256 balanceBefore = IERC20(addrUSDC).balanceOf(address(this));
+
+        // The call will revert if the swap produces less than minAmountOut, or if there's another issue.
+        router.execute{value: msg.value}(commands, inputs, block.timestamp);
+
+        uint256 balanceAfter = IERC20(addrUSDC).balanceOf(address(this));
+        uint256 amountReceivedUSDC = balanceAfter - balanceBefore;
+
+        balance[msg.sender] += amountReceivedUSDC;
+        qttDeposits[msg.sender] += 1;
+        emit Deposited(msg.sender, address(0), msg.value);
     }
 
     /// @notice Deposit Token ERC-20
