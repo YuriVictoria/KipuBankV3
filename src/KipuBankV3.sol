@@ -16,6 +16,10 @@ import {IUniversalRouter} from "./IUniversalRouter.sol";
 contract KipuBankV3 is AccessControl {
     using SafeERC20 for IERC20;
 
+    bytes1 constant V3_SWAP_EXACT_IN = bytes1(0x00);
+    bytes1 constant V3_SWAP_EXACT_OUT = bytes1(0x01);
+    bytes1 constant PERMIT2_TRANSFER_FROM = bytes1(0x02);
+    bytes1 constant WRAP_ETH = bytes1(0x0b);
 
     address public immutable addrUSDC;
     address public immutable addrWETH;
@@ -199,7 +203,7 @@ contract KipuBankV3 is AccessControl {
 
         bytes memory path = abi.encodePacked(addrWETH, POOL, addrUSDC);
 
-        bytes memory commands = abi.encodePacked(IUniversalRouter.V3_SWAP_EXACT_IN);
+        bytes memory commands = abi.encodePacked(V3_SWAP_EXACT_IN);
 
         // The input for V3_SWAP_EXACT_IN: (recipient, amountIn, amountOutMinimum, path, payerIsUser)
         bytes[] memory inputs = new bytes[](1);
