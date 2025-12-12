@@ -149,7 +149,7 @@ contract KipuBankV3 is AccessControl {
         router = IUniversalRouter(_router);
         addrWETH = _addrWETH;
         withdrawLimit = _withdrawLimit;
-        bankCapUSD = _bankCapUSD;
+        bankCap = _bankCap;
     }
 
     /// @notice Allowed a new address Token with oracle
@@ -254,10 +254,10 @@ contract KipuBankV3 is AccessControl {
     }
 
     /// @notice Set new bankCap
-    /// @param _newBankCapUSDC new value of bankCap
-    function setBankCapUSDC(uint256 _newBankCap) external onlyRole(MANAGER_ROLE) {
+    /// @param _newBankCap new value of bankCap
+    function setBankCap(uint256 _newBankCap) external onlyRole(MANAGER_ROLE) {
         bankCap = _newBankCap;
-        emit ChangeBankCapUSDC(bankCap);
+        emit ChangeBankCap(bankCap);
     }
 
     /// @notice Set withdrawLimit
