@@ -27,15 +27,12 @@ contract KipuBankV3 is AccessControl {
 
     /// @notice Map User to balance in USDC
     mapping(address => uint256) private balance;
-    mapping(address => uint256) private balancesInUSDC;
     
     /// @notice Map user(address) to qttDeposits(uint256)
     mapping(address => uint256) private qttDeposits;
-    mapping(address => uint256) private depositCount;
 
     /// @notice Map user(address) to qttWithdrawals(uint256)
     mapping(address => uint256) private qttWithdrawals;
-    mapping(address => uint256) private withdrawalCount;
 
     /// @notice Limit to withdraw operation in USDC.
     uint256 public withdrawLimit;
@@ -195,83 +192,47 @@ contract KipuBankV3 is AccessControl {
         return (_amount * uint256(price) * (10 ** usdcDecimals)) / ((10 ** tokenDecimals) * (10 ** oracleDecimals));
     }
 
-// Essa parte não precisa mais
+    /// @notice Verify conditions and make the deposit of msg.value
+    function depositETH() external payable validDepositValue(msg.value) inBankCap(address(0), msg.value) {
+        try this._swapExactInputSingle(addrWETH, msg.value, _commands, _inputs) returns (uint256 amountUSDC) {
+            balance[msg.sender] += amountUSDC;
+            qttDeposits[msg.sender] += 1;
+            emit Deposited(msg.sender, address(0), msg.value);
+        } catch {
+            revert("Token sem liquidez ou rota invalida na Uniswap");
+        }
+    }
 
-    // /// @notice Calc the contract balance in that moment with loop
-    // function getTotalBankValueInUSDC() public view returns (uint256 totalUSD) {
-    //     for (uint i = 0; i < allowedTokenList.length; i++) {
-    //         address token = allowedTokenList[i];
-    //         uint256 balance;
-            
-    //         if (token == address(0)) {
-    //             balance = address(this).balance;
-    //         } else {
-    //             balance = IERC20(token).balanceOf(address(this));
-    //         }
-
-    //         if (balance > 0) {
-    //             totalUSD += getTokenValueInUSD(token, balance);
-    //         }
-    //     }
-    // }
-
-    // /// @notice Verify conditions and make the deposit of msg.value
-    // function depositETH() external payable validDepositValue(msg.value) inBankCap(address(0), msg.value) {
-    //     try this._swapExactInputSingle(addrWETH, msg.value, _commands, _inputs) returns (uint256 amountUSDC) {
-    //         balanceUSDC[msg.sender] += amoutUSDC;
-    //         qttDeposits[msg.sender] += 1;
-    //         emit Deposited(msg.sender, address(0), msg.value);
-    //     } catch {
-    //         // Se falhar (token ruim, sem liquidez, erro na rota), devolve o token pro usuário
-    //         revert("Token sem liquidez ou rota invalida na Uniswap");
-    //     }
-    // }
-
-    // /// @notice Deposit Token ERC-20
-    // /// @param _token address of token contract
-    // /// @param _amount deposit amount
-    // =================================================================================================
-    // TODO: Implementar a lógica de depósito.
-    // A função de depósito deve:
-    // 1. Receber um token permitido e uma quantidade.
-    // 2. Usar o IUniversalRouter para trocar (swap) o token recebido por USDC.
-    // 3. Adicionar o valor em USDC obtido no balanço do usuário (balancesInUSDC).
-    // 4. Incrementar o contador de depósitos (depositCount).
-    // 5. Emitir o evento Deposited.
-    //
-    // Exemplo de como uma função de depósito para tokens ERC20 poderia ser:
-    // function depositToken(address _token, uint256 _amount) external validDepositValue(_amount) inBankCap(_token, _amount) {
-    //     if (_token == address(0)) revert("Try depositETH");
+    /// @notice Deposit Token ERC-20
+    /// @param _token address of token contract
+    /// @param _amount deposit amount
+    function depositToken(address _token, uint256 _amount) external validDepositValue(_amount) inBankCap(_token, _amount) {
+        if (_token == address(0)) revert("Try depositETH");
         
-    //     balances[_token][msg.sender] += _amount;
-    //     qttDeposits[msg.sender] += 1;
+        balance[msg.sender] += _amount;
+        qttDeposits[msg.sender] += 1;
         
-    //     bool success = IERC20(_token).transferFrom(msg.sender, address(this), _amount);
-    //     require(success, "Transfer failed");
+        bool success = IERC20(_token).transferFrom(msg.sender, address(this), _amount);
+        require(success, "Transfer failed");
 
-    //     emit Deposited(msg.sender, _token, _amount);
-    //     // 1. Transferir o token para este contrato
-    //     IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
-    //     // 2. Aprovar o Router para gastar o token
-    //     IERC20(_token).safeApprove(address(router), _amount);
-    //     // 3. Chamar a função execute() do router com os comandos de swap
-    //     // ... lógica do swap ...
-    //     // 4. Atualizar balanço, contador e emitir evento.
-    // }
-    // =================================================================================================
+        emit Deposited(msg.sender, _token, _amount);
+        // 1. Transferir o token para este contrato
+        IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
+        // 2. Aprovar o Router para gastar o token
+        IERC20(_token).safeApprove(address(router), _amount);
+        // 3. Chamar a função execute() do router com os comandos de swap
+        // ... lógica do swap ...
+        // 4. Atualizar balanço, contador e emitir evento.
+    }
 
-/// O saque deve ser feito para um token que a pessoa selecionar
-
-    // /// @notice withdrawUSDC
-    // /// @param _amountUSDC withdraw value
+    /// @notice withdrawUSDC
+    /// @param _amountUSDC withdraw value
     function withdrawUSDC(uint256 _amountUSDC) external
     hasBalance(_amountUSDC)
     validWithdrawAmount(_amountUSDC)
     inWithdrawLimit(_amountUSDC) {
-        balances[msg.sender] -= _amountUSDC;
+        balance[msg.sender] -= _amountUSDC;
         qttWithdrawals[msg.sender] += 1;
-        balancesInUSDC[msg.sender] -= _amountUSDC;
-        withdrawalCount[msg.sender] += 1;
         emit Withdrew(msg.sender, _amountUSDC);
 
         IERC20(addrUSDC).safeTransfer(msg.sender, _amountUSDC);
