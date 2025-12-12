@@ -6,9 +6,18 @@ import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IER
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
-/// @title KipuBankV2
+import {IPermit2} from "https://github.com/Uniswap/permit2/blob/main/src/interfaces/IPermit2.sol";
+import {IUniversalRouter} from "./IUniversalRouter.sol";
+
+
+/// @title KipuBankV3
 /// @author @YuriVictoria
 contract KipuBankV3 is AccessControl {
+
+    address public immutable addrUSDC;
+    address public immutable addrWETH;
+    IPermit2 public immutable permit;
+    IUniversalRouter public immutable router;
 
     /// @notice Token(address) to Chainlink oracle(address) 
     mapping(address => address) public tokenToOracle;
@@ -16,28 +25,32 @@ contract KipuBankV3 is AccessControl {
     /// @notice List of allowed tokens in this contract
     address[] public allowedTokenList;
 
-    /// @notice Map Token to Map User, and user(address) to Token balance(uint256)
-    mapping(address => mapping(address => uint256)) private balances;
+    /// @notice Map User to balance in USDC
+    mapping(address => uint256) private balance;
+    mapping(address => uint256) private balancesInUSDC;
     
     /// @notice Map user(address) to qttDeposits(uint256)
     mapping(address => uint256) private qttDeposits;
+    mapping(address => uint256) private depositCount;
 
     /// @notice Map user(address) to qttWithdrawals(uint256)
     mapping(address => uint256) private qttWithdrawals;
+    mapping(address => uint256) private withdrawalCount;
 
-    /// @notice Limit to withdraw operation.
+    /// @notice Limit to withdraw operation in USDC.
     uint256 public withdrawLimit;
+    uint256 public withdrawLimitInUSDC;
     
-    /// @notice Limit to bankCap in USD
-    uint256 public bankCapUSD; 
+    /// @notice Limit to bankCap in USDC
+    uint256 public bankCap; 
+    uint256 public bankCapInUSDC; 
     
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
 
     /// @notice The Withdraw event 
     /// @param user who make the withdrawal
-    /// @param token the withdraw token
     /// @param value the withdrawal value
-    event Withdrew(address indexed user, address indexed token, uint256 value);
+    event Withdrew(address indexed user, uint256 value);
 
     /// @notice The Deposit event 
     /// @param user who make the deposit
@@ -46,12 +59,12 @@ contract KipuBankV3 is AccessControl {
     event Deposited(address indexed user, address indexed token, uint256 value);
     
     /// @notice Set new withdrawLimit 
-    /// @param value of new withdrawLimit
-    event ChangeWithdrawLimit(uint256 value);
+    /// @param newWithdrawLimit the new withdrawLimit in USDC
+    event ChangeWithdrawLimit(uint256 newWithdrawLimit);
 
-    /// @notice Set new bankCapUSD
-    /// @param value of new bankCapUSD
-    event ChangeBankCapUSD(uint256 value);
+    /// @notice Set new bankCap in USDC
+    /// @param newBankCap of new bankCap in USDC
+    event ChangeBankCap(uint256 newBankCap);
     
     /// @notice Set new allowed token
     /// @param token address of new token
@@ -100,36 +113,44 @@ contract KipuBankV3 is AccessControl {
 
     /// @notice Revert if insufficient balance of token
     /// @param _amount value of withdraw
-    /// @param _token address of contract token
-    modifier hasBalance(address _token, uint256 _amount) {
-        if (_amount > balances[_token][msg.sender]) revert NoBalance();
+    modifier hasBalance(uint256 _amount) {
+        if (_amount > balance[msg.sender]) revert NoBalance();
         _;
     }
 
-    /// @notice Revert if contract balance in USD pass the bankCap
-    modifier inBankCap(address _tokenIncoming, uint256 _amountIncoming) {
-        uint256 incomingValueUSD = getTokenValueInUSD(_tokenIncoming, _amountIncoming);
-        uint256 currentBankTotalUSD = getTotalBankValueInUSD();
-
-        if (currentBankTotalUSD + incomingValueUSD > bankCapUSD) {
-            revert BankCapLimit();
-        }
+    /// @notice Revert if contract balance pass the bankCap
+    /// @param _token The token being deposited
+    /// @param _amount The amount of the token being deposited
+    modifier inBankCap(address _token, uint256 _amount) {
+        uint256 valueInUSDC = getTokenValueInUSDC(_token, _amount);
+        if (IERC20(addrUSDC).balanceOf(address(this)) + valueInUSDC > bankCap) { revert BankCapLimit(); }
         _;
     }
 
     /// @notice Revert if try deposit 0
-    modifier validDepositValue(uint256 _amount) {                              
+    modifier validDepositValue(uint256 _amount) {
         if (_amount == 0) revert NothingToDeposit();
         _;
     }
 
     /// @notice The deployer defines the withdrawnLimit and bankCap.
-    /// @param _withdrawLimit Define the limit to withdraw
-    /// @param _bankCapUSD Define bank capacity in USD
-    constructor(uint256 _withdrawLimit, uint256 _bankCapUSD) {
+    /// @param _withdrawLimit Define the limit to withdraw in USDC
+    /// @param _bankCap Define bank capacity in USDC
+    constructor(
+        uint256 _withdrawLimit,
+        uint256 _bankCap,
+        address _addrUSDC,
+        address _permit,
+        address _router,
+        address _addrWETH
+    ) {
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(MANAGER_ROLE, msg.sender);
 
+        addrUSDC = _addrUSDC;
+        permit = IPermit2(_permit);
+        router = IUniversalRouter(_router);
+        addrWETH = _addrWETH;
         withdrawLimit = _withdrawLimit;
         bankCapUSD = _bankCapUSD;
     }
@@ -140,103 +161,120 @@ contract KipuBankV3 is AccessControl {
     function setAllowedToken(address _token, address _oracle) external onlyRole(MANAGER_ROLE) {
         if (tokenToOracle[_token] == address(0)) {
             allowedTokenList.push(_token);
-        }   
+        }
         tokenToOracle[_token] = _oracle;
         emit TokenConfigured(_token, _oracle);
     }
 
-    /// @notice token to USD token
+    /// @notice token to USDC token
     /// @param _token address token contract
     /// @param _amount qtt of token
-    function getTokenValueInUSD(address _token, uint256 _amount) public view returns (uint256) {
+    function getTokenValueInUSDC(address _token, uint256 _amount) public view returns (uint256) {
         address oracleAddr = tokenToOracle[_token];
         if (oracleAddr == address(0)) revert TokenNotAllowed();
+
+        // Se o token for o próprio USDC, o valor é o próprio _amount.
+        if (_token == addrUSDC) {
+            return _amount;
+        }
 
         AggregatorV3Interface oracle = AggregatorV3Interface(oracleAddr);
         (, int256 price, , , ) = oracle.latestRoundData();
         if (price <= 0) revert InvalidOraclePrice();
-        uint256 priceUint = uint256(price);
 
-        uint8 decimalsToken;
-        if (_token == address(0)) {
-            decimalsToken = 18;
-        } else {
-            decimalsToken = IERC20Metadata(_token).decimals();
-        }
+        uint8 tokenDecimals = (_token == address(0)) ? 18 : IERC20Metadata(_token).decimals();
+        uint8 usdcDecimals = IERC20Metadata(addrUSDC).decimals();
+        uint8 oracleDecimals = oracle.decimals();
 
-        return (_amount * priceUint * 1e10) / (10 ** decimalsToken);
+        // A fórmula para conversão de valor considerando as casas decimais é:
+        // valorFinal = (quantidadeToken * preçoOracle * 10^decimaisTokenFinal) / (10^decimaisTokenInicial * 10^decimaisOracle)
+        // No nosso caso, o token final é sempre USDC.
+        // O preço do oracle (ex: ETH/USD) tem 'oracleDecimals' casas decimais.
+        // A quantidade do token de entrada tem 'tokenDecimals' casas decimais.
+        // Queremos o resultado em unidades atômicas de USDC, que tem 'usdcDecimals' casas decimais.
+        return (_amount * uint256(price) * (10 ** usdcDecimals)) / ((10 ** tokenDecimals) * (10 ** oracleDecimals));
     }
 
-    /// @notice Calc the contract balance in that moment with loop
-    function getTotalBankValueInUSD() public view returns (uint256 totalUSD) {
-        for (uint i = 0; i < allowedTokenList.length; i++) {
-            address token = allowedTokenList[i];
-            uint256 balance;
+// Essa parte não precisa mais
+
+    // /// @notice Calc the contract balance in that moment with loop
+    // function getTotalBankValueInUSDC() public view returns (uint256 totalUSD) {
+    //     for (uint i = 0; i < allowedTokenList.length; i++) {
+    //         address token = allowedTokenList[i];
+    //         uint256 balance;
             
-            if (token == address(0)) {
-                balance = address(this).balance;
-            } else {
-                balance = IERC20(token).balanceOf(address(this));
-            }
+    //         if (token == address(0)) {
+    //             balance = address(this).balance;
+    //         } else {
+    //             balance = IERC20(token).balanceOf(address(this));
+    //         }
 
-            if (balance > 0) {
-                totalUSD += getTokenValueInUSD(token, balance);
-            }
-        }
-    }
+    //         if (balance > 0) {
+    //             totalUSD += getTokenValueInUSD(token, balance);
+    //         }
+    //     }
+    // }
 
-    /// @notice Verify conditions and make the deposit of msg.value
-    function depositETH() external payable validDepositValue(msg.value) inBankCap(address(0), msg.value) {
-        balances[address(0)][msg.sender] += msg.value;
-        qttDeposits[msg.sender] += 1;
-        emit Deposited(msg.sender, address(0), msg.value);
-    }
+    // /// @notice Verify conditions and make the deposit of msg.value
+    // function depositETH() external payable validDepositValue(msg.value) inBankCap(address(0), msg.value) {
+    //     try this._swapExactInputSingle(addrWETH, msg.value, _commands, _inputs) returns (uint256 amountUSDC) {
+    //         balanceUSDC[msg.sender] += amoutUSDC;
+    //         qttDeposits[msg.sender] += 1;
+    //         emit Deposited(msg.sender, address(0), msg.value);
+    //     } catch {
+    //         // Se falhar (token ruim, sem liquidez, erro na rota), devolve o token pro usuário
+    //         revert("Token sem liquidez ou rota invalida na Uniswap");
+    //     }
+    // }
 
-    /// @notice Deposit Token ERC-20
-    /// @param _token address of token contract
-    /// @param _amount deposit amount
-    function depositToken(address _token, uint256 _amount) external validDepositValue(_amount) inBankCap(_token, _amount) {
-        if (_token == address(0)) revert("Try depositETH");
+    // /// @notice Deposit Token ERC-20
+    // /// @param _token address of token contract
+    // /// @param _amount deposit amount
+    // =================================================================================================
+    // TODO: Implementar a lógica de depósito.
+    // A função de depósito deve:
+    // 1. Receber um token permitido e uma quantidade.
+    // 2. Usar o IUniversalRouter para trocar (swap) o token recebido por USDC.
+    // 3. Adicionar o valor em USDC obtido no balanço do usuário (balancesInUSDC).
+    // 4. Incrementar o contador de depósitos (depositCount).
+    // 5. Emitir o evento Deposited.
+    //
+    // Exemplo de como uma função de depósito para tokens ERC20 poderia ser:
+    // function depositToken(address _token, uint256 _amount) external validDepositValue(_amount) inBankCap(_token, _amount) {
+    //     if (_token == address(0)) revert("Try depositETH");
         
-        balances[_token][msg.sender] += _amount;
-        qttDeposits[msg.sender] += 1;
+    //     balances[_token][msg.sender] += _amount;
+    //     qttDeposits[msg.sender] += 1;
         
-        bool success = IERC20(_token).transferFrom(msg.sender, address(this), _amount);
-        require(success, "Transfer failed");
+    //     bool success = IERC20(_token).transferFrom(msg.sender, address(this), _amount);
+    //     require(success, "Transfer failed");
 
-        emit Deposited(msg.sender, _token, _amount);
-    }
+    //     emit Deposited(msg.sender, _token, _amount);
+    //     // 1. Transferir o token para este contrato
+    //     IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
+    //     // 2. Aprovar o Router para gastar o token
+    //     IERC20(_token).safeApprove(address(router), _amount);
+    //     // 3. Chamar a função execute() do router com os comandos de swap
+    //     // ... lógica do swap ...
+    //     // 4. Atualizar balanço, contador e emitir evento.
+    // }
+    // =================================================================================================
 
-    /// @notice Verify conditions and make the withdraw ETH of amount
-    /// @param _amount value of withdraw
-    function withdrawETH(uint256 _amount) external hasBalance(address(0), _amount) validWithdrawAmount(_amount) inWithdrawLimit(_amount) {
-        balances[address(0)][msg.sender] -= _amount;
+/// O saque deve ser feito para um token que a pessoa selecionar
+
+    // /// @notice withdrawUSDC
+    // /// @param _amountUSDC withdraw value
+    function withdrawUSDC(uint256 _amountUSDC) external
+    hasBalance(_amountUSDC)
+    validWithdrawAmount(_amountUSDC)
+    inWithdrawLimit(_amountUSDC) {
+        balances[msg.sender] -= _amountUSDC;
         qttWithdrawals[msg.sender] += 1;
-        emit Withdrew(msg.sender, address(0), _amount);
-        
-        makePayETH(msg.sender, _amount);
-    }
+        balancesInUSDC[msg.sender] -= _amountUSDC;
+        withdrawalCount[msg.sender] += 1;
+        emit Withdrew(msg.sender, _amountUSDC);
 
-    /// @notice Make the payment
-    /// @param _to who receive the payment
-    /// @param _amount value of payment    
-    function makePayETH(address _to, uint256 _amount) private {
-        (bool ok,) = payable(_to).call{value: _amount}("");
-        if (!ok) revert FailWithdraw();
-    }
-
-    /// @notice withdraw token
-    /// @param _token the addres of token
-    /// @param _amount withdraw value
-    function withdrawToken(address _token, uint256 _amount) external hasBalance(_token, _amount) validWithdrawAmount(_amount) inWithdrawLimit(_amount) {
-        if (_token == address(0)) revert("Use withdrawETH");
-
-        balances[_token][msg.sender] -= _amount;
-        qttWithdrawals[msg.sender] += 1;
-        emit Withdrew(msg.sender, _token, _amount);
-
-        bool success = IERC20(_token).transfer(msg.sender, _amount);
-        if (!success) revert FailWithdraw();
+        IERC20(addrUSDC).safeTransfer(msg.sender, _amountUSDC);
     }
 
     /// @notice Get qttDeposits of msg.sender
@@ -249,28 +287,27 @@ contract KipuBankV3 is AccessControl {
         return qttWithdrawals[msg.sender];
     }
 
-    /// @notice Get token balance of msg.sender
-    /// @param _token address of contract token
-    function getBalance(address _token) external view returns (uint256) {
-        return balances[_token][msg.sender];
+    /// @notice Get balance of msg.sender
+    function getBalance() external view returns (uint256) {
+        return balance[msg.sender];
     }
 
-    /// @notice Set new bankCapUSD
-    /// @param _newBankCapUSD new value of bankCapUSD 
-    function setBankCapUSD(uint256 _newBankCapUSD) external onlyRole(MANAGER_ROLE) {
-        bankCapUSD = _newBankCapUSD;
-        emit ChangeBankCapUSD(bankCapUSD);
+    /// @notice Set new bankCap
+    /// @param _newBankCapUSDC new value of bankCap
+    function setBankCapUSDC(uint256 _newBankCap) external onlyRole(MANAGER_ROLE) {
+        bankCap = _newBankCap;
+        emit ChangeBankCapUSDC(bankCap);
     }
 
     /// @notice Set withdrawLimit
     function setWithdrawLimit(uint256 _newWithdrawLimit) external onlyRole(MANAGER_ROLE) {
         withdrawLimit = _newWithdrawLimit;
-        emit ChangeWithdrawLimit(withdrawLimit);
+        emit ChangeWithdrawLimit(_newWithdrawLimit);
     }
 
-    /// @notice Get bankCapUSD
+    /// @notice Get bankCap
     function getBankCap() external view returns (uint256) {
-        return bankCapUSD;
+        return bankCap;
     }
 
     /// @notice Get withdrawLimit
