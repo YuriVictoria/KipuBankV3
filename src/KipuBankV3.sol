@@ -46,11 +46,9 @@ contract KipuBankV3 is AccessControl {
 
     /// @notice Limit to withdraw operation in USDC.
     uint256 public withdrawLimit;
-    uint256 public withdrawLimitInUSDC;
     
     /// @notice Limit to bankCap in USDC
     uint256 public bankCap; 
-    uint256 public bankCapInUSDC; 
     
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
 
@@ -103,6 +101,9 @@ contract KipuBankV3 is AccessControl {
 
     /// @notice Thrown when the oracle price is negative or zero
     error InvalidOraclePrice();
+
+    /// @notice Thrown when the transaction deadline has passed
+    error TransactionExpired();
 
     /// @notice Revert if withdraw pass the limit
     /// @param _amount value of withdrawal
@@ -197,7 +198,10 @@ contract KipuBankV3 is AccessControl {
     }
 
     /// @notice Verify conditions and make the deposit of msg.value
-    function depositETH() external payable validDepositValue(msg.value) inBankCap(address(0), msg.value) {
+    /// @param _deadline The deadline for the swap to be executed.
+    function depositETH(uint256 _deadline) external payable validDepositValue(msg.value) inBankCap(address(0), msg.value) {
+        if (block.timestamp > _deadline) revert TransactionExpired();
+
         uint256 priceUSDCInChainlink = getTokenValueInUSDC(address(0), msg.value);
         uint256 minSwap = (priceUSDCInChainlink * (10000 - TOLERANCE)) / 10000;
 
@@ -205,7 +209,6 @@ contract KipuBankV3 is AccessControl {
 
         bytes memory commands = abi.encodePacked(V3_SWAP_EXACT_IN);
 
-        // The input for V3_SWAP_EXACT_IN: (recipient, amountIn, amountOutMinimum, path, payerIsUser)
         bytes[] memory inputs = new bytes[](1);
         inputs[0] = abi.encode(
             address(this),
@@ -217,8 +220,7 @@ contract KipuBankV3 is AccessControl {
 
         uint256 balanceBefore = IERC20(addrUSDC).balanceOf(address(this));
 
-        // The call will revert if the swap produces less than minAmountOut, or if there's another issue.
-        router.execute{value: msg.value}(commands, inputs, block.timestamp);
+        router.execute{value: msg.value}(commands, inputs, _deadline);
 
         uint256 balanceAfter = IERC20(addrUSDC).balanceOf(address(this));
         uint256 amountReceivedUSDC = balanceAfter - balanceBefore;
@@ -231,16 +233,57 @@ contract KipuBankV3 is AccessControl {
     /// @notice Deposit Token ERC-20
     /// @param _token address of token contract
     /// @param _amount deposit amount
-    function depositToken(address _token, uint256 _amount) external validDepositValue(_amount) inBankCap(_token, _amount) {
+    /// @param _deadline The deadline for the transaction to be executed.
+    /// @param permitData The signed Permit2 data from the user, allowing the Universal Router to pull tokens.
+    function depositToken(
+        address _token,
+        uint256 _amount,
+        uint256 _deadline,
+        IPermit2.PermitSingle calldata permitData
+    ) external validDepositValue(_amount) inBankCap(_token, _amount) {
+        if (block.timestamp > _deadline) revert TransactionExpired();
         if (_token == address(0)) revert("Use depositETH()");
+
         if (_token == addrUSDC) {
-            IERC20(addrUSDC).safeTransferFrom(msg.sender, address(this), _amount);
+            // For direct USDC deposits, use Permit2 to pull tokens directly to this contract,
+            // avoiding the need for a separate `approve` transaction from the user.
+            permit.permitTransferFrom(permitData, IPermit2.SignatureTransferDetails({to: address(this), requestedAmount: _amount}));
+
             balance[msg.sender] += _amount;
             qttDeposits[msg.sender] += 1;
             emit Deposited(msg.sender, _token, _amount);
         } else {
-            IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
-            revert("Swap logic for this token is not yet implemented.");
+            // For other tokens, use the Universal Router with Permit2 for an atomic transfer and swap.
+            // The deadline is also enforced by the signed permitData itself.
+            // 1. Calculate the minimum amount of USDC to receive.
+            uint256 priceUSDCInChainlink = getTokenValueInUSDC(_token, _amount);
+            uint256 minSwap = (priceUSDCInChainlink * (10000 - TOLERANCE)) / 10000;
+
+            bytes memory commands = abi.encodePacked(PERMIT2_TRANSFER_FROM, V3_SWAP_EXACT_IN);
+
+            bytes[] memory inputs = new bytes[](2);
+
+            inputs[0] = abi.encode(_token, _amount);
+
+            bytes memory path = abi.encodePacked(_token, POOL, addrUSDC);
+            inputs[1] = abi.encode(
+                address(this),
+                _amount,
+                minSwap,
+                path,
+                false
+            );
+
+            uint256 balanceBefore = IERC20(addrUSDC).balanceOf(address(this));
+
+            router.execute(commands, inputs, permitData, msg.sender);
+
+            uint256 balanceAfter = IERC20(addrUSDC).balanceOf(address(this));
+            uint256 amountReceivedUSDC = balanceAfter - balanceBefore;
+
+            balance[msg.sender] += amountReceivedUSDC;
+            qttDeposits[msg.sender] += 1;
+            emit Deposited(msg.sender, _token, _amount);
         }
     }
 
